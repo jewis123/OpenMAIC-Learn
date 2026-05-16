@@ -1,0 +1,488 @@
+我来帮您生成这个工程的架构设计详细文档。首先，让我探索这个项目的结构。让我获取更多关键的架构信息：现在我有了足够的信息来生成详细的架构设计文档。让我组织这些信息，创建一个全面的架构说明文档。
+
+## OpenMAIC 工程架构设计详细文档
+
+本文档阐述了 OpenMAIC（Open Multi-Agent Interactive Classroom）的分层架构设计，重点关注系统的核心设计理念、分层模型和关键子系统。
+
+---
+
+### 一、系统概览
+
+**OpenMAIC** 是一个多智能体交互式虚拟教室平台，采用 **Next.js 16** 作为前后端框架，**LangGraph** 驱动多智能体编排，**Zustand** 管理状态，**Dexie/IndexedDB** 本地存储。
+
+**核心价值主张**：通过"从课程大纲到交互式场景"的两阶段生成管道，将任意学习需求转化为由多个智能体驱动的沉浸式课堂体验。
+
+---
+
+### 二、分层架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              表现层 (UI & Components)                        │
+│  ├─ Stage (舞台控制器)                                      │
+│  ├─ Roundtable (多智能体讨论界面)                           │
+│  ├─ SlideRenderer (幻灯片编辑/播放)                         │
+│  ├─ SceneRenderers (场景类型：Quiz/Interactive/PBL)        │
+│  └─ Settings (配置面板)                                    │
+└─────────────────────────────────────────────────────────────┘
+                           ↕ (双向通信)
+┌─────────────────────────────────────────────────────────────┐
+│        业务逻辑层 (Playback & Action Execution)              │
+│  ├─ PlaybackEngine (播放状态机)                             │
+│  │   ├─ idle / playing / paused / live                     │
+│  │   ├─ Scene 导航 & 快照恢复                              │
+│  │   └─ Discussion 状态管理                                │
+│  ├─ ActionEngine (28+种动作执行)                           │
+│  │   ├─ 演讲 (Speech/TTS)                                 │
+│  │   ├─ 白板绘制 (WbDraw*)                                │
+│  │   ├─ 聚光灯/激光指针 (Fire-and-Forget)                 │
+│  │   ├─ 讨论触发 (Discussion)                             │
+│  │   └─ 小部件交互 (Widget*)                              │
+│  └─ PlaybackView (派生状态计算)                            │
+└─────────────────────────────────────────────────────────────┘
+                           ↕
+┌─────────────────────────────────────────────────────────────┐
+│     实时编排层 (Multi-Agent Orchestration)                   │
+│  ├─ LangGraph Director Graph                               │
+│  │   ├─ directorNode (谁说话决策)                          │
+│  │   ├─ agentGenerateNode (单智能体生成)                  │
+│  │   └─ 条件路由 (next/USER/END)                         │
+│  ├─ Stateless Generator (流式 SSE)                        │
+│  │   ├─ text_delta (自然演讲)                             │
+│  │   ├─ action (28+种动作)                                │
+│  │   └─ 实时解析 (Partial-JSON)                          │
+│  └─ StructuredPrompt 组合                                 │
+│      ├─ SystemMessage (角色定义)                          │
+│      └─ ConversationContext (讨论历史)                    │
+└─────────────────────────────────────────────────────────────┘
+                           ↕
+┌─────────────────────────────────────────────────────────────┐
+│      课程生成层 (Lesson Generation Pipeline)                │
+│  ├─ Stage 1: 大纲生成 (Outline Generation)                │
+│  │   ├─ 用户需求 + PDF + 教学上下文 → 场景大纲           │
+│  │   └─ 多媒体资源规划                                    │
+│  ├─ Stage 2: 场景内容生成 (Content Generation)           │
+│  │   ├─ generateSlideContent (幻灯片)                     │
+│  │   ├─ generateQuizContent (测试)                        │
+│  │   ├─ generateInteractiveContent (交互式)              │
+│  │   └─ generatePBLContent (项目学习)                    │
+│  ├─ Action 生成层                                        │
+│  │   └─ 场景动作序列编排                                 │
+│  └─ 媒体生成处理                                        │
+│      ├─ 图像生成 (DALL-E/Stable Diffusion)              │
+│      └─ TTS 合成                                       │
+└─────────────────────────────────────────────────────────────┘
+                           ↕
+┌─────────────────────────────────────────────────────────────┐
+│      基础设施层 (Core Services & Storage)                    │
+│  ├─ LLM 提供商抽象                                        │
+│  │   ├─ OpenAI / Anthropic / Google / 等                  │
+│  │   └─ 统一接口 (ai SDK)                                │
+│  ├─ PDF 解析系统 (Dual-Provider)                         │
+│  │   ├─ unpdf (内置，基础)                               │
+│  │   └─ MinerU (本地，高级)                              │
+│  ├─ 本地存储层 (IndexedDB via Dexie)                     │
+│  │   ├─ stages (课程元数据)                              │
+│  │   ├─ scenes (场景内容)                                │
+│  │   ├─ chatSessions (讨论记录)                          │
+│  │   ├─ mediaFiles (生成的媒体)                          │
+│  │   └─ playbackState (播放进度)                         │
+│  └─ 服务端存储 (API 生成的课程)                         │
+│      └─ /data/classrooms/*.json                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 三、核心子系统详解
+
+#### **3.1 PlaybackEngine（播放状态机）**
+
+**设计理念**：将课程播放建模为有限状态机，统一管理讲座播放、讨论转换和用户中断。
+
+**状态转移图**：
+```
+idle ─(start())──→ playing ─(pause())──→ paused
+  ↑                   ↓                       │
+  │             (scene actions)              │
+  │                   ↓                       │
+  └─── live ←─ handleEndDiscussion() ──(resume())─┘
+       │
+    (讨论中：多智能体交互)
+```
+
+**核心概念**：
+- **Scene Iteration**: 通过 `sceneIndex` & `actionIndex` 追踪播放位置
+- **Action Execution**: 依次执行 Scene.actions[]，区分"fire-and-forget"（聚光灯、激光）和同步动作（演讲、白板）
+- **Snapshot Restoration**: 支持长课程的"保存进度 → 刷新后恢复"能力
+- **Live Mode**: 从播放模式切换到"直播讨论"（多智能体编排接管），处理用户打断、代理交互
+
+**关键约束**：
+- 单个 Scene 必须完整播放其所有 Actions，不可跳过
+- 场景切换需要清理前置讨论状态（使用 `consumedDiscussions` 集合去重）
+
+---
+
+#### **3.2 ActionEngine（28+种动作执行层）**
+
+**设计理念**：行为统一接口。所有代理与演示的交互都通过 Action 对象实现，无后门。
+
+**动作分类**：
+
+| 类别 | 动作类型 | 执行策略 | 用途 |
+|------|---------|--------|------|
+| **视觉效果** | spotlight, laser | Fire-and-Forget | 幻灯片上聚焦元素 |
+| **演讲** | speech | 同步 (等待 TTS) | 代理语音叙述 |
+| **白板** | wb_draw_*, wb_edit_*, wb_clear | 同步 | 实时绘制方程、图表 |
+| **交互** | discussion | 同步→异步 | 触发多智能体讨论 |
+| **小部件** | widget_* | 同步 (IFrame 消息) | 向嵌入式UI发送命令 |
+
+**执行流程**：
+```
+Action (speech, wb_draw_text, etc)
+  ↓
+ActionEngine.execute(action)
+  ├─ [可选] 自动打开白板
+  ├─ 按类型分发到特定处理器
+  ├─ [同步] 等待完成 (TTS 播放、白板渲染)
+  └─ Promise 解决 → PlaybackEngine 执行下一个 Action
+```
+
+**智能化设计**：
+- 白板动作自动触发 `ensureWhiteboardOpen()`（如果白板关闭）
+- 集中化 AudioPlayer 与 WidgetIFrame 通信逻辑
+- 支持部分 JSON 流式解析实时展现代理输出
+
+---
+
+#### **3.3 Director Graph（多智能体编排）**
+
+**设计理念**：用 LangGraph 的 StateGraph 实现"谁说话"决策引擎。两条代码路径共存：
+
+**单智能体路径**（纯代码，零 LLM 调用）：
+```
+Turn 0: 派遣代理
+Turn 1+: 提示用户说话 (cue_user)
+```
+
+**多智能体路径**（LLM 决策 + 代码快路）：
+```
+Turn 0 + triggerAgentId: 快路→派遣触发代理
+Turn 1+: 询问 Director LLM "下一个谁说话？"
+  ├─ 决策: 派遣 Agent A
+  ├─ 决策: 派遣 Agent B  
+  ├─ 决策: 提示用户 (USER)
+  └─ 决策: 结束讨论 (END)
+```
+
+**LangGraph 拓扑**：
+```
+START → director ──(end)──→ END
+           │
+           └─(next)→ agent_generate → director (循环)
+```
+
+**消息流（实时 SSE）**：
+- `directorNode` 决策后，分发到 `agentGenerateNode`
+- 代理通过 `adapter.streamGenerate()` 生成 JSON Array：
+  ```json
+  [
+    {"type":"text", "content":"Today we'll..."},
+    {"type":"action", "name":"spotlight", "params":{"elementId":"el-1"}},
+    {"type":"text", "content":"Notice how..."}
+  ]
+  ```
+- 实时 Partial-JSON 解析器逐字符流式解析，`writer()` 推送 StatelessEvent 到客户端
+
+**状态容器 (OrchestratorState)**：
+- `messages`: 对话历史
+- `agentResponses`: 代理本轮摘要（用于下轮决策）
+- `whiteboardLedger`: 白板动作记录
+- `turnCount` / `maxTurns`: 轮次跟踪
+
+---
+
+#### **3.4 二阶段课程生成管道**
+
+**设计理念**：将复杂的课程构建分解为两个独立的 LLM 调用阶段，降低单次 token 消耗，提高可控性。
+
+**Stage 1: 大纲生成**
+```
+输入:
+  - 用户需求文本 (requirement)
+  - PDF 内容 + 图像 (pdfText, pdfImages)
+  - 教学上下文 (researchContext, teacherContext)
+  - 学习者档案 (userProfile)
+
+流程:
+  buildPrompt(PROMPT_IDS.outline) 
+    → LLM 生成 JSON
+    → 解析 SceneOutline[]
+    → 添加多媒体生成规划 (mediaGenerations)
+
+输出:
+  SceneOutline[] (包含大纲、媒体规划)
+```
+
+**Stage 2: 场景内容生成**（并行处理每个大纲）
+```
+对于每个 SceneOutline:
+
+if (type === 'slide'):
+  generateSlideContent()
+    ├─ 为每个幻灯片生成文本内容
+    ├─ 创建画布元素 (文本、图像、表格)
+    └─ 返回 GeneratedSlideContent
+
+if (type === 'quiz'):
+  generateQuizContent()
+    └─ 题目 + 选项 + 答案反馈
+
+if (type === 'interactive'):
+  generateInteractiveContent()
+    └─ HTML 代码 + 交互性脚本
+
+if (type === 'pbl'):
+  generatePBLContent()
+    └─ 项目声明 + 里程碑
+
+并行执行:
+  generateSceneActions(outline, content, ...)
+    └─ 将内容转换为 Action[]
+       (speech, whiteboard, spotlight, discussion, ...)
+```
+
+**关键设计决策**：
+1. **无中间编译步骤**：Action 直接来自生成，无额外转换
+2. **图像映射策略**：MinerU 生成的图像（`img_1`, `img_2`）通过 `imageMapping` Dict 传递
+3. **提示模板系统**：所有提示存储在 `/lib/prompts/templates/` 的 Markdown 中，支持变量插值与条件块
+
+---
+
+#### **3.5 状态管理架构（Zustand 多层分离）**
+
+**设计理念**：按功能域分离状态存储，避免单一巨型 Store。
+
+**核心状态存储**：
+
+| Store | 作用域 | 生命周期 |
+|-------|--------|--------|
+| `useStageStore` | 课程元数据 + 场景列表 | 加载时初始化 → 本地持久化 |
+| `useCanvasStore` | 幻灯片编辑状态（选择元素、工具模式） | 编辑会话期间 |
+| `useSettingsStore` | 全局配置（LLM 提供商、TTS、ASR）| 用户设置 |
+| `usePlaybackStore` | ~~已弃用~~ 现用 PlaybackEngine 替代 | — |
+| `useMediaGenerationStore` | 异步图像/视频生成任务 | 生成期间追踪 |
+| `useAgentRegistry` | 代理配置（内置 + 服务端生成） | 会话期间 |
+| `useWhiteboardHistoryStore` | 白板撤销/重做堆栈 | 编辑会话期间 |
+| `useWidgetIframeStore` | 小部件 IFrame 消息通道 | 场景加载时设置 |
+
+**关键原则**：
+- **最小化订阅**：组件仅订阅其需要的切片，避免全局重渲染
+- **派生状态**：使用 `useMemo` + `useCallback` 避免计算状态存储
+- **服务端状态**：API 返回的数据临时存储在本地 Store，刷新时重新加载
+
+---
+
+#### **3.6 本地存储系统（IndexedDB via Dexie）**
+
+**架构**：
+```
+MAICDatabase (Dexie Instance)
+  ├─ stages: { id, name, createdAt, updatedAt, ... }
+  ├─ scenes: { id, stageId, order, content, actions }
+  ├─ stageOutlines: { stageId, outlines[] } ← 恢复生成进度
+  ├─ chatSessions: { id, stageId, messages[], type }
+  ├─ playbackState: { stageId, sceneIndex, actionIndex }
+  ├─ mediaFiles: { id, stageId, type, url }
+  ├─ generatedAgents: { id, stageId, config }
+  └─ audioFiles / imageFiles: { id, data (Blob) }
+```
+
+**持久化流程**：
+
+1. **保存**（自动/用户触发）：
+   ```
+   Stage 编辑 → Zustand Store 更新
+   → useEffect 检测更改 → saveStageData()
+   → db.stages.put() + db.scenes.bulkPut()
+   ```
+
+2. **加载**（应用启动/路由切换）：
+   ```
+   ClassroomPage 挂载
+   → loadFromStorage(classroomId)
+   → 查询 IndexedDB
+   → 恢复到 Zustand Store
+   如无 IndexedDB 数据 → 查询 /api/classroom?id=...
+   ```
+
+3. **导出/导入**：
+   - ZIP 导出：将 Stage + Scenes + 媒体 Blob 打包
+   - ZIP 导入：解包 → 导入 IndexedDB → 渲染
+
+**跨课程隔离**：每个课程用 `stageId` 分开索引存储，防止污染。
+
+---
+
+### 四、API 边界与流程
+
+#### **4.1 生成管道 API**
+
+| 端点 | 用途 | 流程 |
+|------|------|------|
+| `POST /api/generate-classroom` | 异步课程生成 | 提交 + 生成 Job → 轮询 + 结果返回 |
+| `POST /api/scene-stream` | SSE 流式场景生成 | 大纲 + 内容 + 动作流式下发 |
+| `POST /api/parse-pdf` | PDF 解析 | unpdf / MinerU 双路由 |
+| `POST /api/chat` | 讨论 SSE | DirectorGraph + agentGeneration 流式结果 |
+| `GET /api/classroom` | 读取已生成课程 | 服务端 JSON 文件系统 |
+
+#### **4.2 实时讨论流（Server-Sent Events）**
+
+```
+客户端请求: POST /api/chat
+  {
+    messages: [...],
+    storeState: {...},
+    config: { agentIds: [...] }
+  }
+
+服务端处理:
+  1. buildInitialState(request, languageModel)
+  2. graph.stream(initialState, { streamMode: 'custom' })
+  3. 遍历节点事件，writer() 推送 StatelessEvent:
+     - agent_start { agentId, agentName }
+     - text_delta { content }
+     - action { actionName, params }
+     - agent_end { contentPreview, actionCount }
+     - done { totalAgents, totalActions }
+
+客户端接收:
+  for await (const event of response.body)
+    → 更新 UI（Roundtable 气泡、动作执行）
+```
+
+---
+
+### 五、关键设计模式
+
+#### **5.1 "无状态" 编排**
+
+**原则**：所有状态（消息、代理、轮次）通过 Request 体提供，响应不依赖服务端会话。
+
+**优势**：
+- 无状态扩展性（水平伸缩）
+- 客户端驱动恢复逻辑
+- 断网重连容易重发
+
+**实现**：
+```typescript
+export async function* statelessGenerate(
+  request: StatelessChatRequest,  // 完整状态
+  abortSignal: AbortSignal,
+  languageModel: LanguageModel,
+): AsyncGenerator<StatelessEvent> {
+  const graph = createOrchestrationGraph();
+  const initialState = buildInitialState(request, languageModel);
+  // 图处理 + 流式事件生成
+}
+```
+
+#### **5.2 即插即用多智能体**
+
+**原则**：代理配置不绑定服务端，可由客户端动态注入。
+
+**实现**：
+```typescript
+// agentConfigOverrides 在 OrchestratorState 中
+// 查询时：resolveAgent() → 先查覆盖，再查注册表
+function resolveAgent(state: OrchestratorStateType, agentId: string): AgentConfig | undefined {
+  return state.agentConfigOverrides[agentId] || useAgentRegistry.getState().getAgent(agentId);
+}
+```
+
+**场景**：
+- 服务端生成的代理配置通过 `generatedAgentConfigs` 返回
+- 客户端应用后存入 Zustand + IndexedDB
+- 下次加载自动恢复，无需服务端查询
+
+#### **5.3 "双重 PDF 解析"**
+
+**理念**：提供"免费快速"（unpdf）和"高质量精准"（MinerU）两条路线。
+
+**选择策略**：
+- 内置 unpdf → 无依赖，适合演示和快速原型
+- 本地 MinerU → 需自主部署，适合生产环保境和研究
+
+**接口统一**：
+```
+parsePDF(config: { providerId: 'unpdf' | 'mineru', ... }, buffer)
+  → ParsedPdfContent {
+      text, images, tables, formulas, layout, metadata, imageMapping
+    }
+```
+
+---
+
+### 六、性能与可靠性考量
+
+#### **6.1 流式处理优化**
+
+- **Partial-JSON 解析**：实时解析 LLM 流，单个字符级增量推送至客户端
+- **Action 队列化**：PlaybackEngine 串行化 Action 执行，避免竞态
+- **SSE 背压**：若客户端网络慢，Writer 缓冲自动调节
+
+#### **6.2 多智能体"公平性"**
+
+- **轮次限制**：`maxTurns` 防止无限讨论
+- **快路优化**：Turn 0 + triggerAgentId 的快速分发（不走 LLM）
+- **用户打断**：`handleUserInterrupt()` 中止 Discussion，回到 Playback
+
+#### **6.3 媒体生成分离**
+
+- 异步图像/视频生成任务存入 `useMediaGenerationStore`
+- 后台 Worker 或定时任务轮询外部 API（DALL-E、etc）
+- 完成后触发 UI 更新（无阻塞）
+
+---
+
+### 七、扩展点
+
+#### **7.1 新场景类型**
+
+添加方式：
+1. 定义 `SceneType` 新值（如 `survey`）
+2. 创建 `generateSurveyContent()` 函数
+3. 在 `buildSceneFromOutline()` 中添加分支
+4. 在 `SceneRenderer` 中注册渲染器组件
+
+#### **7.2 新 LLM 提供商**
+
+添加方式：
+1. 在 `.env.local` 中添加 API Key
+2. 使用 `ai` SDK 的标准接口
+3. 在 `AISdkLangGraphAdapter` 中调用
+
+#### **7.3 新 PDF 解析提供商**
+
+添加方式：
+1. 在 `lib/pdf/constants.ts` 中定义提供商元数据
+2. 实现 `parseWithMyProvider(config, buffer)` 函数
+3. 在 `lib/pdf/pdf-providers.ts` 中添加路由
+4. 在 `/api/parse-pdf` 中注册
+
+---
+
+### 八、总结
+
+OpenMAIC 的架构遵循以下核心原则：
+
+| 原则 | 实现 |
+|------|------|
+| **关注点分离** | 播放 / 编排 / 生成 / 存储 各自独立 |
+| **流式优先** | 所有长操作（生成、讨论）均 SSE/Stream 支持 |
+| **无状态可伸缩** | 服务端不维护会话，Request 自足 |
+| **本地优先** | IndexedDB 离线支持，刷新不丢数据 |
+| **多智能体一等公民** | LangGraph 原生支持，决策透明 |
+| **统一动作接口** | 所有代理交互都通过 Action 对象，无后门 |
+
+这些设计使得 OpenMAIC 能够灵活适应从"一秒生成课程"到"深度交互探索"的各类使用场景。
